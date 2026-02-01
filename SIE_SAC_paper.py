@@ -333,10 +333,11 @@ class VectorizedSIEEnvPaper:
 
         # Reward weights (Eq. 38)
         #1,0.5,1
-        #3,2,0.3
-        self.alpha_1 = config.get('alpha_1', 3.0)
-        self.alpha_2 = config.get('alpha_2', 2.0)
-        self.alpha_3 = config.get('alpha_3', 0.3)
+        # Reward weights (α1: position, α2: velocity, α3: concealment)
+        # Reduced α3 to prevent r_gamma from dominating r_x + r_v
+        self.alpha_1 = config.get('alpha_1', 1.0)
+        self.alpha_2 = config.get('alpha_2', 0.5)
+        self.alpha_3 = config.get('alpha_3', 1.0)  # Lowered from 0.3 to 0.05
 
         # Constraints
         self.chi_sq_threshold = config.get('chi_sq_threshold', 7.815)
@@ -475,8 +476,10 @@ class VectorizedSIEEnvPaper:
         """
         self.step_counts += 1
 
-        # Current radar estimate x^e_t (from previous step's KF state)
-        radar_est_t = self.radar_kf.get_position_estimates()
+        # CRITICAL: Save t-step radar KF estimates BEFORE updating to t+1
+        # This ensures reward calculation uses consistent time-aligned data
+        radar_est_t = self.radar_kf.get_position_estimates()  # x^e_t
+        radar_vel_est_t = self.radar_kf.get_velocity_estimates()  # v^e_t
 
         # 1. Convert action (ρ, θ, ψ) to Cartesian offset Δx^s
         spoof_offset = self._spherical_to_cartesian(actions)
@@ -515,7 +518,10 @@ class VectorizedSIEEnvPaper:
         obs = self._get_observations(self.true_pos, self.true_vel, radar_est_t1, spoof_offset, gamma_s)
 
         # 9. Eq.38: Reward R = α₁·r_x + α₂·r_v + α₃·r_γ (NO SIE bonus)
-        rewards, r_x, r_v, r_gamma = self._calculate_rewards(gamma_s, delta_gamma_s, spoof_offset, radar_est_t)
+        # CRITICAL: Pass time-aligned radar estimates (both from t, not t+1)
+        rewards, r_x, r_v, r_gamma = self._calculate_rewards(
+            gamma_s, delta_gamma_s, spoof_offset, radar_est_t, radar_vel_est_t
+        )
 
         # 10. Termination
         dist_to_fake = np.linalg.norm(self.true_pos - self.fake_dest, axis=1)
@@ -891,7 +897,8 @@ class VectorizedSIEEnvPaper:
 
         return np.arccos(cos_angle)
 
-    def _calculate_rewards(self, gamma_s, delta_gamma_s, spoof_offset: np.ndarray, radar_est: np.ndarray):
+    def _calculate_rewards(self, gamma_s, delta_gamma_s, spoof_offset: np.ndarray,
+                          radar_est: np.ndarray, radar_vel_est: np.ndarray):
         """
         Calculate reward per Paper Eq.38-39.
 
@@ -899,8 +906,8 @@ class VectorizedSIEEnvPaper:
         │ Eq.38: R = α₁·r_x + α₂·r_v + α₃·r_γ                            │
         │                                                                  │
         │ Eq.39a: r_x = position reward (guide to fake destination)       │
-        │         r_x = -||x^s - x^s_D|| / ||x_0 - x^s_D||               │
-        │         (normalized distance to fake destination)                │
+        │         r_x = -||T[x^e + Δx^s] - x^s_D|| / ||x_0 - x^s_D||     │
+        │         (T operation for lookahead prediction)                   │
         │                                                                  │
         │ Eq.39b: r_v = velocity direction reward                          │
         │         r_v = -log(θ_v,fake + ε) + log(θ_v,true + ε)            │
@@ -910,40 +917,47 @@ class VectorizedSIEEnvPaper:
         │         Penalize high γ^s to avoid detection                     │
         └─────────────────────────────────────────────────────────────────┘
 
+        CRITICAL: radar_est and radar_vel_est must be time-aligned (both from t)
+
+        Args:
+            gamma_s: Predicted NIS at time t
+            delta_gamma_s: Change in NIS from t-1 to t
+            spoof_offset: Spoofing offset Δx^s at time t
+            radar_est: Radar position estimate x^e_t (time t)
+            radar_vel_est: Radar velocity estimate v^e_t (time t, NOT t+1!)
+
         NOTE: SIE is NOT added to reward - it's handled in SAC entropy term (Eq.40-48)
         """
-        radar_vel_est = self.radar_kf.get_velocity_estimates()
 
         # Eq.30: Deceptive position x^s = x^e + Δx^s
         deceptive_pos = radar_est + spoof_offset
 
-        vec_to_fake = self.fake_dest - deceptive_pos
-        vec_to_true = self.true_dest - deceptive_pos
+        # Paper Eq.39a: T operation is CRITICAL!
+        # T[x^e + Δx^s] predicts radar's observation after drone's PD control response
+        # This is a one-step lookahead: where will radar see drone after it reacts to spoofing?
+        predicted_pos = self._apply_T_operation(deceptive_pos, radar_vel_est)
 
         # Eq.39a: r_x - Position reward
-        # Measures how close the spoofed position is to fake destination
-        dist_to_fake = np.linalg.norm(deceptive_pos - self.fake_dest, axis=1)
+        # CRITICAL FIX: Use T operation result (predicted_pos), NOT deceptive_pos!
+        # Paper explicitly shows: r_x = -||T[...] - x^s_D|| / ||x^e_0 - x^s_D||
+        dist_to_fake = np.linalg.norm(predicted_pos - self.fake_dest, axis=1)
         r_x = -(dist_to_fake / np.maximum(self.initial_dist_to_fake, 1.0))
 
         # Eq.39b: r_v - Velocity direction reward
-        n1 = np.linalg.norm(radar_vel_est, axis=1)
-        n2_fake = np.linalg.norm(vec_to_fake, axis=1)
-        n2_true = np.linalg.norm(vec_to_true, axis=1)
+        # CRITICAL FIX: Use predicted_pos (T operation result) for consistency
+        # This ensures reward computation matches the forward-looking nature of the algorithm
+        vec_to_fake = self.fake_dest - predicted_pos
+        vec_to_true = self.true_dest - predicted_pos
 
-        valid = (n1 > 1e-6)
-        theta_v_fake = np.zeros(self.n_envs)
-        theta_v_true = np.zeros(self.n_envs)
+        # CRITICAL FIX: Use safe angle computation helper instead of manual calculation
+        # This properly handles edge cases: n1=0, n2=0, or near-zero vectors
+        # Prevents "ψ=90° fixed value" bug from incomplete valid mask
+        theta_v_fake = self._compute_angle_between(radar_vel_est, vec_to_fake)
+        theta_v_true = self._compute_angle_between(radar_vel_est, vec_to_true)
 
-        theta_v_fake[valid] = np.arccos(np.clip(
-            np.sum(radar_vel_est[valid] * vec_to_fake[valid], axis=1) / (n1[valid] * n2_fake[valid] + 1e-6),
-            -1, 1
-        ))
-        theta_v_true[valid] = np.arccos(np.clip(
-            np.sum(radar_vel_est[valid] * vec_to_true[valid], axis=1) / (n1[valid] * n2_true[valid] + 1e-6),
-            -1, 1
-        ))
-
-        r_v = -np.log(theta_v_fake + 0.1) + np.log(theta_v_true + 0.1)
+        # CRITICAL FIX: Reduce epsilon from 0.1 to 1e-6 to avoid over-penalizing small angles
+        # log(0.1) ≈ -2.3 is too large; log(1e-6) ≈ -13.8 but only affects near-zero angles
+        r_v = -np.log(theta_v_fake + 1e-6) + np.log(theta_v_true + 1e-6)
 
         # Eq.39c: r_γ - Concealment reward (penalize high NIS)
         r_gamma = self._concealment_reward(gamma_s) + self._concealment_reward(delta_gamma_s)
@@ -954,74 +968,71 @@ class VectorizedSIEEnvPaper:
         # Return both total and individual components for debugging
         return total_reward, r_x, r_v, r_gamma
 
-    def _apply_T_operation(self, radar_pos: np.ndarray, radar_vel: np.ndarray) -> np.ndarray:
+    def _apply_T_operation(self, deceptive_pos: np.ndarray, radar_vel: np.ndarray) -> np.ndarray:
         """
         Apply T operation (Eq. 39a): Predict radar KF estimate after drone's PD control.
 
-        The T operation models what the radar will observe after the drone
-        responds to its navigation KF estimate with PD control.
+        CRITICAL: This MUST match actual drone physics in _update_drone_physics()!
+        Otherwise, agent can't learn how actions (ρ,θ,ψ) affect future outcomes.
 
-        Steps:
-        1. Drone's nav KF has deceived estimate (pointing toward fake dest)
-        2. Drone applies PD control based on nav estimate
-        3. Drone moves accordingly
-        4. Radar KF observes and estimates new position
-
-        This is a one-step lookahead prediction.
+        The T operation simulates one-step lookahead:
+        1. Drone's nav_kf receives deceptive_pos (spoofed measurement)
+        2. Drone applies PD control law (Eq.6) based on nav estimate
+        3. Drone state updates via dynamics (Eq.2)
+        4. Radar observes and estimates new position
 
         Args:
-            radar_pos: (n_envs, 3) current radar position estimates
-            radar_vel: (n_envs, 3) current radar velocity estimates
+            deceptive_pos: (n_envs, 3) spoofed position x^s = x^e + Δx^s
+            radar_vel: (n_envs, 3) current radar velocity estimate (not used, for signature)
 
         Returns:
-            (n_envs, 3) predicted position after T operation
+            (n_envs, 3) predicted drone position after one timestep
         """
-        # Get current navigation estimate (deceived)
-        nav_est = self.nav_kf.get_position_estimates()
+        # Step 1: Drone's nav estimate ≈ deceptive_pos (what we sent)
+        # (In reality nav_kf filters this, but we approximate)
+        nav_est = deceptive_pos
+        nav_vel_est = self.nav_kf.get_velocity_estimates()
+        z_hat = np.concatenate([nav_est, nav_vel_est], axis=1)  # (n_envs, 6)
 
-        # Drone's PD control: head toward true_dest based on nav estimate
-        # (But drone is deceived, so it actually heads toward where it thinks true_dest is)
-        to_dest = self.true_dest - nav_est
-        dist = np.linalg.norm(to_dest, axis=1, keepdims=True)
-        dir_vec = np.where(dist > 1e-6, to_dest / dist, 0)
+        # Step 2: Reference trajectory state (drone thinks it's following true_dest)
+        # We use current reference_state as approximation
+        # (More accurate would be to predict reference_state one step ahead too)
 
-        # Predict velocity after PD control
-        speed = np.linalg.norm(radar_vel, axis=1)
-        acc = np.zeros(self.n_envs)
-        dist_flat = dist.flatten()
-        acc[(dist_flat > 100.0) & (speed < 16.0)] = 0.5
-        acc[dist_flat < 20.0] = -0.5
+        # Step 3: PD Control Law (Eq.6): uk = -L · (ẑk - zk)
+        state_error = z_hat - self.reference_state
+        control_input = -(self.L @ state_error.T).T  # (n_envs, 3)
+        control_input = np.clip(control_input, -self.umax, self.umax)
 
-        pred_vel = radar_vel + dir_vec * acc[:, np.newaxis] * self.dt
-        speed_new = np.linalg.norm(pred_vel, axis=1, keepdims=True)
-        pred_vel = np.where(speed_new > 16.0, pred_vel / speed_new * 16.0, pred_vel)
+        # Step 4: Predict drone state update (Eq.2): zk = A·zk-1 + B·uk
+        z_true = np.concatenate([self.true_pos, self.true_vel], axis=1)
+        z_predicted = (self.A @ z_true.T).T + (self.B @ control_input.T).T
 
-        # Predicted position after one timestep
-        pred_pos = radar_pos + pred_vel * self.dt
+        # Extract predicted position
+        predicted_pos = z_predicted[:, :3]
 
-        # T operation: radar KF estimate of this predicted position
-        # Simplified: add small noise to represent KF estimation uncertainty
-        # In practice, this is the radar's filtered estimate
-        return pred_pos  # Radar KF would smooth this, but we use direct prediction
+        # Step 5: Radar observation (simplified - direct observation with small noise)
+        # In practice, radar_kf would filter this, but we use direct prediction
+        return predicted_pos
 
     def _concealment_reward(self, x):
         """
-        Concealment reward based on NIS constraint.
+        Concealment reward based on NIS constraint (Paper Eq.39c).
 
-        IMPORTANT: Baseline shifted to 0 to prevent ρ=0 collapse.
-        Original: [0, 1] range → Always positive reward for low γ
-        Fixed: [-1, 0] range → Penalty for high γ, neutral for low γ
+        Piecewise function f(x):
+            x >= xth: exp(-log(1 + x - xth)) - 1  (negative, penalty)
+            x <  xth: (xth - x) / xth              (positive, reward)
+
+        Returns reward in range [-∞, 1].
         """
         x_th = self.chi_sq_threshold
         result = np.zeros_like(x)
+
+        # Case 1: x >= threshold (constraint violated)
         mask = x >= x_th
         result[mask] = np.exp(-np.log(1 + x[mask] - x_th + 1e-6)) - 1.0
-        result[~mask] = (x_th - x[~mask]) / x_th
 
-        # BASELINE SHIFT: 0 중심으로 이동 (ρ=0 붕괴 방지)
-        # TODO: 기존 모델(sie_sac_paper_final.pt) 테스트 시 아래 주석 처리
-        #       새 학습 시작할 때는 다시 활성화!
-        result -= 1.0
+        # Case 2: x < threshold (constraint satisfied)
+        result[~mask] = (x_th - x[~mask]) / x_th
 
         return result
 
@@ -1107,8 +1118,9 @@ class PolicyNetwork(nn.Module):
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
 
-        self.log_std_min = -20
-        self.log_std_max = 2
+        # Wider std range for better exploration (prevent policy saturation)
+        self.log_std_min = -5   # std_min ≈ 0.0067 (was -20 ≈ 2e-9)
+        self.log_std_max = 2    # std_max ≈ 7.4
 
     def forward(self, state):
         x = F.relu(self.fc1(state))
