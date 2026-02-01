@@ -548,10 +548,10 @@ class VectorizedSIEEnvPaper:
         infos = []
         for i in range(self.n_envs):
             infos.append({
-                'true_pos': self.true_pos[i],
-                'radar_est': radar_est_t[i],  # FIXED: was undefined radar_est
-                'nav_est': nav_est[i],
-                'deceptive_pos': deceptive_pos[i],
+                'true_pos': self.true_pos[i].copy(),  # IMPORTANT: copy() to avoid reference to reset value
+                'radar_est': radar_est_t[i].copy(),
+                'nav_est': nav_est[i].copy(),
+                'deceptive_pos': deceptive_pos[i].copy(),
                 'gamma_s': gamma_s[i],
                 'drone_nis': drone_nis[i],
                 'dist_to_fake': dist_to_fake[i],
@@ -1021,7 +1021,7 @@ class VectorizedSIEEnvPaper:
         # BASELINE SHIFT: 0 중심으로 이동 (ρ=0 붕괴 방지)
         # TODO: 기존 모델(sie_sac_paper_final.pt) 테스트 시 아래 주석 처리
         #       새 학습 시작할 때는 다시 활성화!
-        # result -= 1.0
+        result -= 1.0
 
         return result
 

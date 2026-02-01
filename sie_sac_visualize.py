@@ -170,8 +170,17 @@ def run_episode(env, model, max_steps=10000):
     """에피소드 실행 및 데이터 수집"""
     obs, _ = env.reset()
 
+    # 실제 시작 위치 저장 (랜덤 노이즈 포함)
+    if USE_PAPER_ENV:
+        actual_start_pos = env.true_pos.copy()
+    elif hasattr(env, 'simulator'):
+        actual_start_pos = env.simulator.true_pos.copy()
+    else:
+        actual_start_pos = np.array([0.0, 0.0, -20.0])  # fallback
+
     # 데이터 기록용
     data = {
+        'start_position': actual_start_pos,  # 실제 시작 위치 (랜덤 노이즈 포함)
         'drone_positions': [],      # 드론 실제 위치
         'spoof_positions': [],      # 기만 신호 위치 (x^s = x^e + Δx^s)
         'radar_estimates': [],      # 레이더 추정 위치 (x^e)
@@ -202,10 +211,11 @@ def run_episode(env, model, max_steps=10000):
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
 
-        # 데이터 기록 - 환경 타입에 따라 다르게 처리
+        # 데이터 기록 - info에서 가져오기 (auto-reset 전 데이터)
+        # env.true_pos는 auto-reset 후 값이므로 사용하면 안됨!
         if USE_PAPER_ENV:
-            # VectorizedSIEEnvPaper 래퍼 사용
-            true_pos = env.true_pos.copy()
+            # VectorizedSIEEnvPaper: info에 pre-reset 데이터가 있음
+            true_pos = info.get('true_pos', env.true_pos.copy())
             radar_est = info.get('radar_est', true_pos)
         elif hasattr(env, 'simulator'):
             # 기존 SIESACEnv 사용
@@ -256,9 +266,104 @@ def run_episode(env, model, max_steps=10000):
 
     # numpy 배열로 변환
     for key in data:
-        data[key] = np.array(data[key])
+        if key != 'start_position':  # start_position은 이미 numpy array
+            data[key] = np.array(data[key])
 
     return data, step
+
+
+def save_trajectory_data(data, env, filename='trajectory_data.txt'):
+    """
+    궤적 데이터를 텍스트 파일로 저장.
+
+    저장 내용:
+    - Episode 요약 (시작점, 목적지, 최종 위치)
+    - 모든 스텝의 드론 위치
+    - 모든 스텝의 기만 신호 위치
+    - 모든 스텝의 액션
+    - 모든 스텝의 보상
+    """
+    start_pos = data['start_position']  # 실제 시작 위치 (랜덤 노이즈 포함)
+    drone_pos = data['drone_positions']
+    spoof_pos = data['spoof_positions']
+    radar_est = data['radar_estimates']
+    actions = data['actions']
+    rewards = data['rewards']
+
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write("="*80 + "\n")
+        f.write("SIE-SAC Trajectory Data\n")
+        f.write("="*80 + "\n\n")
+
+        # Episode 요약
+        f.write("[Episode Summary]\n")
+        f.write(f"Total steps: {len(drone_pos)}\n\n")
+
+        # 시작 및 목적지 (실제 시작 위치 사용)
+        f.write("[Positions]\n")
+        f.write(f"Start position:        ( {start_pos[0]:8.2f}, {start_pos[1]:8.2f}, {start_pos[2]:8.2f} )\n")
+        f.write(f"True destination:      ( {env.true_dest[0]:8.2f}, {env.true_dest[1]:8.2f}, {env.true_dest[2]:8.2f} )\n")
+        f.write(f"Fake destination:      ( {env.fake_dest[0]:8.2f}, {env.fake_dest[1]:8.2f}, {env.fake_dest[2]:8.2f} )\n\n")
+
+        # 최종 위치
+        f.write("[Final Positions]\n")
+        f.write(f"Final drone position:  ( {drone_pos[-1, 0]:8.2f}, {drone_pos[-1, 1]:8.2f}, {drone_pos[-1, 2]:8.2f} )\n")
+        f.write(f"Final radar estimate:  ( {radar_est[-1, 0]:8.2f}, {radar_est[-1, 1]:8.2f}, {radar_est[-1, 2]:8.2f} )\n")
+        f.write(f"Final spoof position:  ( {spoof_pos[-1, 0]:8.2f}, {spoof_pos[-1, 1]:8.2f}, {spoof_pos[-1, 2]:8.2f} )\n\n")
+
+        # 최종 거리
+        dist_to_true = np.linalg.norm(drone_pos[-1] - env.true_dest)
+        dist_to_fake = np.linalg.norm(drone_pos[-1] - env.fake_dest)
+        f.write(f"Distance to true dest: {dist_to_true:8.2f} m\n")
+        f.write(f"Distance to fake dest: {dist_to_fake:8.2f} m\n\n")
+
+        # 최종 액션
+        f.write("[Final Action]\n")
+        f.write(f"ρ (offset magnitude): {actions[-1, 0]:8.2f} m\n")
+        f.write(f"θ (azimuth):          {np.degrees(actions[-1, 1]):8.2f}°\n")
+        f.write(f"ψ (elevation):        {np.degrees(actions[-1, 2]):8.2f}°\n\n")
+
+        # 전체 궤적 데이터
+        f.write("="*80 + "\n")
+        f.write("Full Trajectory Data\n")
+        f.write("="*80 + "\n\n")
+
+        f.write(f"{'Step':>5} | {'Drone Position (x, y, z)':>30} | {'Spoof Position (x, y, z)':>30} | {'ρ':>8} | {'θ(°)':>8} | {'ψ(°)':>8} | {'Reward':>10}\n")
+        f.write("-"*80 + "\n")
+
+        for i in range(len(drone_pos)):
+            f.write(f"{i:5d} | "
+                   f"({drone_pos[i, 0]:8.2f}, {drone_pos[i, 1]:8.2f}, {drone_pos[i, 2]:8.2f}) | "
+                   f"({spoof_pos[i, 0]:8.2f}, {spoof_pos[i, 1]:8.2f}, {spoof_pos[i, 2]:8.2f}) | "
+                   f"{actions[i, 0]:8.2f} | "
+                   f"{np.degrees(actions[i, 1]):8.2f} | "
+                   f"{np.degrees(actions[i, 2]):8.2f} | "
+                   f"{rewards[i]:10.4f}\n")
+
+        f.write("\n" + "="*80 + "\n")
+        f.write("Additional Debug Data\n")
+        f.write("="*80 + "\n\n")
+
+        # Spoof offset 상세 정보
+        if 'spoof_offset_xyz' in data:
+            spoof_offset_xyz = data['spoof_offset_xyz']
+            f.write("[Spoofing Offset Statistics]\n")
+            f.write(f"Mean offset: dx={spoof_offset_xyz[:, 0].mean():8.2f}, dy={spoof_offset_xyz[:, 1].mean():8.2f}, dz={spoof_offset_xyz[:, 2].mean():8.2f}\n")
+            f.write(f"Std  offset: dx={spoof_offset_xyz[:, 0].std():8.2f}, dy={spoof_offset_xyz[:, 1].std():8.2f}, dz={spoof_offset_xyz[:, 2].std():8.2f}\n\n")
+
+        # Reward 상세 정보
+        if 'reward_components' in data:
+            reward_comp = data['reward_components']
+            f.write("[Reward Components Statistics]\n")
+            f.write(f"Mean r_x:     {reward_comp[:, 0].mean():10.4f}\n")
+            f.write(f"Mean r_v:     {reward_comp[:, 1].mean():10.4f}\n")
+            f.write(f"Mean r_gamma: {reward_comp[:, 2].mean():10.4f}\n\n")
+
+        f.write("="*80 + "\n")
+        f.write("End of File\n")
+        f.write("="*80 + "\n")
+
+    print(f">>> 궤적 데이터 저장: {filename}")
 
 
 def visualize_realtime(env, model, max_steps=1000, update_interval=5):
@@ -267,6 +372,14 @@ def visualize_realtime(env, model, max_steps=1000, update_interval=5):
     fig, ax = plt.subplots(figsize=(12, 10))
 
     obs, _ = env.reset()
+
+    # 실제 시작 위치 저장
+    if USE_PAPER_ENV:
+        start_pos = env.true_pos.copy()
+    elif hasattr(env, 'simulator'):
+        start_pos = env.simulator.true_pos.copy()
+    else:
+        start_pos = np.array([0.0, 0.0, -20.0])
 
     # 데이터 기록
     drone_path = []
@@ -277,6 +390,7 @@ def visualize_realtime(env, model, max_steps=1000, update_interval=5):
     total_reward = 0
 
     print(">>> 실시간 시뮬레이션 시작...")
+    print(f"    시작 위치: {start_pos}")
     print(f"    실제 목적지: {env.true_dest}")
     print(f"    기만 목적지: {env.fake_dest}")
 
@@ -292,9 +406,9 @@ def visualize_realtime(env, model, max_steps=1000, update_interval=5):
         done = terminated or truncated
         total_reward += reward
 
-        # 위치 기록 - 환경 타입에 따라 다르게 처리
+        # 위치 기록 - info에서 가져오기 (auto-reset 전 데이터)
         if USE_PAPER_ENV:
-            true_pos = env.true_pos.copy()
+            true_pos = info.get('true_pos', env.true_pos.copy())
             radar_est = info.get('radar_est', true_pos)
         elif hasattr(env, 'simulator'):
             true_pos = env.simulator.true_pos.copy()
@@ -319,8 +433,8 @@ def visualize_realtime(env, model, max_steps=1000, update_interval=5):
         if step % update_interval == 0:
             ax.clear()
 
-            # 목적지 표시
-            ax.scatter(0, 0, c='green', marker='s', s=150, label='Start', zorder=5)
+            # 목적지 표시 (실제 시작 위치 사용)
+            ax.scatter(start_pos[0], start_pos[1], c='green', marker='s', s=150, label='Start', zorder=5)
             ax.scatter(env.true_dest[0], env.true_dest[1], c='blue', marker='*',
                       s=300, label='True Destination', zorder=5)
             ax.scatter(env.fake_dest[0], env.fake_dest[1], c='red', marker='X',
@@ -729,6 +843,7 @@ def plot_3d_trajectory(data, env):
     fig = plt.figure(figsize=(14, 10))
     ax = fig.add_subplot(111, projection='3d')
 
+    start_pos = data['start_position']  # 실제 시작 위치 (랜덤 노이즈 포함)
     drone_pos = data['drone_positions']
     spoof_pos = data['spoof_positions']
 
@@ -740,8 +855,9 @@ def plot_3d_trajectory(data, env):
     ax.plot(spoof_pos[:, 0], spoof_pos[:, 1], spoof_pos[:, 2],
             'm--', linewidth=1.5, label='Spoofed Position', alpha=0.7)
 
-    # 시작점
-    ax.scatter(0, 0, -20, c='green', marker='s', s=150, label='Start')
+    # 시작점 (실제 시작 위치 사용)
+    ax.scatter(start_pos[0], start_pos[1], start_pos[2],
+               c='green', marker='s', s=150, label='Start')
 
     # 목적지들
     ax.scatter(env.true_dest[0], env.true_dest[1], env.true_dest[2],
@@ -895,7 +1011,11 @@ def main():
         # Z축 편향 디버깅 분석
         print("\n>>> Z축 편향 디버깅 분석 시작...")
         plot_debug_analysis(data)
-    
+
+        # 궤적 데이터를 텍스트 파일로 저장
+        print("\n>>> 궤적 데이터 저장 중...")
+        save_trajectory_data(data, env, filename='trajectory_data.txt')
+
     print("\n>>> 시각화 완료!")
 
 
