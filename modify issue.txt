@@ -1,48 +1,62 @@
-3) “결과가 잘 안 나오는” 원인 후보: step()에서 특히 위험한 불일치/버그 포인트
+핵심 변경사항
+1. 환경 메모리 추가 (SIE_SAC_paper.py:365-368)
 
-여기부터가 핵심이야. 학습이 꼬이는 패턴이 나올 수 있는 부분들이 step에 꽤 보여.
+# 1-step delayed spoofing offset (MDP state memory)
+# Action a_t generates offset that is applied in next step
+# This ensures s_{t+1} has consistent time indices: x^e_{t+1} and x^s_{t+1}
+self.last_spoof_offset = np.zeros((n_envs, 3), dtype=np.float64)
+2. Reset에서 초기화 (SIE_SAC_paper.py:451)
 
-(1) 다음 상태(obs)에서 시간 인덱스가 섞여 있음
-
-step은 obs를 만들 때:
-
-radar_est로는 **t+1의 radar_est_t1 (=x^e_{t+1})**를 넣고 
-
-SIE_SAC_paper
-
-그런데 deceptive_pos는 **t에서 만든 x^s_t (=x^e_t+Δx^s_t)**를 그대로 넣어. 
-
-SIE_SAC_paper
-
-문제는 _get_observations() 내부 주석이 “radar_est와 deceptive_pos가 같은 time step이어야 한다”는 전제를 이미 깔고 있어. (특히 fallback 재계산 설명에서 그 전제를 노골적으로 말함) 
-
-SIE_SAC_paper
-
-즉, s2(삼각형 각) 계산에 들어가는 spoof_pos가 t의 값인데 s1은 t+1 레이더 좌표라서, 상태가 논문 정의와 어긋나거나 최소한 “일관된 k시점 상태”가 아닐 가능성이 커. 이건 학습 난이도를 크게 올릴 수 있어.
-
-증상: critic이 상태-전이 일관성을 못 잡고 value가 튀거나, policy가 이상한 offset을 내다가 수렴이 안 되는 패턴.
-
-(2) γ^s 계산 주석과 실제 계산이 서로 안 맞음 (nav_kf와 무관하게 계산됨)
-
-step에서 “nav_kf update 후에 γ^s를 계산해야 S가 최신”이라고 적어놨지만 
-
-SIE_SAC_paper
+self.last_spoof_offset[indices] = 0.0  # No spoofing at initialization
+3. step() 로직 재설계 (SIE_SAC_paper.py:466-545)
+새로운 타임라인:
 
 
-실제 _calculate_predicted_nis()는 레이더 KF의 state covariance(M_radar)를 가져와 Σ^s를 만들고 
+# 1. Action a_t → new_spoof_offset 계산 (다음 스텝용)
+new_spoof_offset = self._spherical_to_cartesian(actions)
 
-SIE_SAC_paper
+# 2. UAV에는 이전 스텝의 offset 적용
+deceptive_pos = radar_est_t + self.last_spoof_offset
+
+# 3. gamma_s는 현재 적용 중인 offset 기반
+gamma_s, M_radar = self._calculate_predicted_nis(self.last_spoof_offset)
+
+# 4. 환경 시뮬레이션 → radar_est_t1
+
+# 5. 다음 상태 s_{t+1} - 시간 인덱스 일치!
+deceptive_pos_t1 = radar_est_t1 + new_spoof_offset  # 둘 다 t+1
+obs = self._get_observations(..., radar_est_t1, deceptive_pos_t1, ...)
+
+# 6. Offset 업데이트 (다음 스텝용)
+self.last_spoof_offset = new_spoof_offset.copy()
+문제 해결 결과
+✅ (1) 시간 인덱스 일관성 (논문 Eq. 29)
+Before:
+
+s_{t+1} = [x^e_{t+1}, x^s_{t}, ...] ❌ (시간 불일치)
+After:
+
+s_{t+1} = [x^e_{t+1}, x^s_{t+1}, ...] ✓ (같은 시간!)
+x^s_{t+1} = x^e_{t+1} + new_spoof_offset
+✅ (2) γ^s 계산 명확화
+주석 수정:
+
+"nav_kf update 후에 γ^s를 계산해야 S가 최신" ❌
+"Paper Eq.17-18: γ^s uses radar_kf state covariance M (NOT nav_kf S!)" ✓
+코드는 이미 올바름:
 
 
-거기에 **고정 sigma_spoof=10.0**을 더해서 γ^s를 계산해. 
+gamma_s, M_radar = self._calculate_predicted_nis(self.last_spoof_offset)
+radar_kf의 M 사용 (맞음)
+nav_kf의 S와 무관 (맞음)
+논문 근거
+Eq. 29: State s_k는 같은 시간 k의 모든 요소 포함
+Proposition 1: k와 k-1의 offset이 함께 영향 → state에 offset 포함이 자연스러움
+물리적 의미: GPS 스푸핑 신호는 연속적, action 효과가 다음 스텝에 나타남
+예상 효과
+이 수정으로 학습 안정성이 크게 향상될 것입니다:
 
-SIE_SAC_paper
-
-즉,
-
-nav_kf의 innovation covariance(S)랑은 직접 연결이 없고
-
-“언제 계산하느냐( nav_kf update 전/후 )”가 γ^s에 거의 영향을 안 줄 수 있어.
-
-이 불일치는 **논문 의도(γ^s가 탐지 제약을 반영)**와 다르게 γ^s가 “그냥 오프셋 마할라노비스 거리”로만 굳어질 수 있어. (특히 sigma_spoof가 튜닝이 안 맞으면 γ^s 스케일이 망가짐)
-모델 기반 해법보다 최대 엔트로피 강화학습(MERL) 이 적합하다.”
+Critic이 일관된 state transition 학습 가능
+Value 추정의 분산 감소
+Policy가 더 일관된 offset 생성
+ρ→0 collapse 완화 가능성

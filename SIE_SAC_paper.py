@@ -328,7 +328,8 @@ class VectorizedSIEEnvPaper:
         # Environment parameters
         self.true_dest = np.array(config.get('true_dest', [800.0, 0.0, -20.0]))
         self.fake_dest = np.array(config.get('fake_dest', [800.0, -100.0, -20.0]))
-        self.dt = config.get('dt', 0.1)
+        self.dt = config.get('dt', 1.0)
+        # self.dt = config.get('dt', 0.1)
         self.rho_e = config.get('rho_e', 1200.0)  # Paper Table I: 1200m
 
         # Reward weights (Eq. 38)
@@ -362,6 +363,11 @@ class VectorizedSIEEnvPaper:
         self.step_counts = np.zeros(n_envs, dtype=np.int32)
         self.prev_gamma_s = np.zeros(n_envs, dtype=np.float64)
         self.initial_dist_to_fake = np.zeros(n_envs, dtype=np.float64)
+
+        # 1-step delayed spoofing offset (MDP state memory)
+        # Action a_t generates offset that is applied in next step
+        # This ensures s_{t+1} has consistent time indices: x^e_{t+1} and x^s_{t+1}
+        self.last_spoof_offset = np.zeros((n_envs, 3), dtype=np.float64)
 
         self._rng = np.random.default_rng()
 
@@ -443,6 +449,7 @@ class VectorizedSIEEnvPaper:
         self.step_counts[indices] = 0
         self.prev_gamma_s[indices] = 0.0
         self.initial_dist_to_fake[indices] = np.linalg.norm(start_pos - self.fake_dest, axis=1)
+        self.last_spoof_offset[indices] = 0.0  # No spoofing at initialization
 
         # Initial radar estimate (x^e)
         radar_est = self.radar_kf.get_position_estimates()
@@ -459,18 +466,25 @@ class VectorizedSIEEnvPaper:
 
     def step(self, actions: np.ndarray):
         """
-        Step with paper-accurate spoofing logic.
+        Step with 1-step delayed spoofing offset (paper-accurate MDP).
 
         ┌─────────────────────────────────────────────────────────────────┐
         │ Eq.30: x^s = x^e + Δx^s                                         │
         │                                                                  │
-        │ Timeline at step t:                                              │
+        │ 1-Step Delay Timeline:                                           │
         │   1. radar_est_t = x^e_t (from previous KF update)              │
-        │   2. Action a_t → Δx^s (spherical to Cartesian)                 │
-        │   3. Deceptive position: x^s_t = x^e_t + Δx^s                   │
+        │   2. Action a_t → new_spoof_offset (for NEXT step)              │
+        │   3. Apply last_spoof_offset (from previous step)                │
+        │      x^s_t = x^e_t + last_spoof_offset                          │
         │   4. Send spoofed signal to drone                                │
-        │   5. Drone updates nav_kf and moves based on deceived estimate  │
-        │   6. Radar observes drone at t+1 → x^e_{t+1}                    │
+        │   5. Drone updates nav_kf and moves                              │
+        │   6. Radar observes → x^e_{t+1}                                 │
+        │   7. Next state: s_{t+1} = [x^e_{t+1}, x^s_{t+1}]               │
+        │      where x^s_{t+1} = x^e_{t+1} + new_spoof_offset             │
+        │   8. Update: last_spoof_offset ← new_spoof_offset               │
+        │                                                                  │
+        │ This ensures s_{t+1} has consistent time indices (both t+1).    │
+        │ Paper Eq.29 requires x^e_k and x^s_k at same time k.            │
         └─────────────────────────────────────────────────────────────────┘
 
         Key: Blind spoofer uses radar KF estimate (x^e), NOT true position.
@@ -481,13 +495,16 @@ class VectorizedSIEEnvPaper:
         # This is needed for buffer storage (x^e_t for SIE calculation)
         radar_est_t = self.radar_kf.get_position_estimates()  # x^e_t
 
-        # 1. Convert action (ρ, θ, ψ) to Cartesian offset Δx^s
-        spoof_offset = self._spherical_to_cartesian(actions)
+        # 1. Convert action a_t (ρ, θ, ψ) to Cartesian offset → for NEXT step
+        new_spoof_offset = self._spherical_to_cartesian(actions)
 
-        # 2. Eq.30: Deceptive position x^s = x^e + Δx^s
-        deceptive_pos = radar_est_t + spoof_offset
+        # 2. Apply PREVIOUS offset (from last step) to UAV
+        # Eq.30: x^s_t = x^e_t + Δx^s_{t-1}
+        # This is the offset that was decided in the previous step
+        applied_offset = self.last_spoof_offset.copy()  # For logging/reward calculation
+        deceptive_pos = radar_est_t + applied_offset
 
-        # 3. Spoofed measurement sent to drone (based on deceptive position)
+        # 3. Spoofed measurement sent to drone (based on current offset)
         spoofed_meas = deceptive_pos
 
         # 4. Drone's nav KF processes spoofed signal
@@ -495,9 +512,10 @@ class VectorizedSIEEnvPaper:
         _, drone_nis = self.nav_kf.update(spoofed_meas)
         nav_est = self.nav_kf.get_position_estimates()
 
-        # 5. Calculate predicted NIS (γ^s) - must be done after nav_kf update
-        # so that S reflects the current innovation covariance
-        gamma_s, M_radar = self._calculate_predicted_nis(spoof_offset)
+        # 5. Calculate predicted NIS (γ^s) for REWARD (actual effect)
+        # Uses APPLIED offset (last_spoof_offset) - what was actually sent to UAV
+        # Paper Eq.17-18: γ^s uses radar_kf state covariance M (NOT nav_kf S!)
+        gamma_s_applied, M_radar = self._calculate_predicted_nis(self.last_spoof_offset)
 
         # 6. Drone flies based on its (deceived) estimate → true_pos becomes t+1
         self._update_drone_physics(nav_est)
@@ -510,21 +528,30 @@ class VectorizedSIEEnvPaper:
         self.radar_kf.predict()
         self.radar_kf.update(radar_measurement)
         radar_est_t1 = self.radar_kf.get_position_estimates()  # x^e_{t+1}
-        delta_gamma_s = np.abs(gamma_s - self.prev_gamma_s)
-        self.prev_gamma_s = gamma_s.copy()
 
-        # 8. Eq.29: Build state observations s = [s1, s2, s3, s4]
-        # CRITICAL: Pass deceptive_pos (absolute coords) NOT spoof_offset!
-        # deceptive_pos = x^e_t + Δx^s_t is what was actually sent to UAV
-        # Using radar_est_t1 + spoof_offset would give wrong position (x^e_{t+1} + Δx^s_t)
-        obs = self._get_observations(self.true_pos, self.true_vel, radar_est_t1, deceptive_pos, gamma_s)
+        # 8. Calculate predicted NIS (γ^s) for OBS (time consistency)
+        # Uses NEW offset (new_spoof_offset) - consistent with x^s_{t+1} in state
+        # This ensures s_{t+1} has all components at same time index
+        gamma_s_next, _ = self._calculate_predicted_nis(new_spoof_offset)
 
-        # 9. Eq.38: Reward R = α₁·r_x + α₂·r_v + α₃·r_γ (NO SIE bonus)
+        # Delta gamma: change from previous to current applied
+        delta_gamma_s = np.abs(gamma_s_applied - self.prev_gamma_s)
+        self.prev_gamma_s = gamma_s_applied.copy()
+
+        # 9. Build next state s_{t+1} with CONSISTENT time indices (Paper Eq.29)
+        # s_{t+1} = [x^e_{t+1}, x^s_{t+1}, γ^s_{t+1}] where ALL are at time t+1
+        # x^s_{t+1} = x^e_{t+1} + new_spoof_offset (from action a_t)
+        # γ^s_{t+1} = predicted NIS for new_spoof_offset
+        deceptive_pos_t1 = radar_est_t1 + new_spoof_offset
+        obs = self._get_observations(self.true_pos, self.true_vel, radar_est_t1, deceptive_pos_t1, gamma_s_next)
+
+        # 10. Eq.38: Reward R = α₁·r_x + α₂·r_v + α₃·r_γ (NO SIE bonus)
+        # Uses APPLIED γ^s (actual detection risk from last_spoof_offset)
         # CRITICAL: radar_est_t1 (x^e_{t+1}) is the result of T[x^e_t + Δx^s]
-        # T operation was performed by the actual simulation above (lines 490-512)
+        # T operation was performed by the actual simulation above (lines 506-518)
         radar_vel_est_t1 = self.radar_kf.get_velocity_estimates()  # v^e_{t+1}
         rewards, r_x, r_v, r_gamma = self._calculate_rewards(
-            gamma_s, delta_gamma_s, radar_est_t1, radar_vel_est_t1
+            gamma_s_applied, delta_gamma_s, radar_est_t1, radar_vel_est_t1
         )
 
         # 10. Termination
@@ -560,8 +587,9 @@ class VectorizedSIEEnvPaper:
                 'true_pos': self.true_pos[i].copy(),  # IMPORTANT: copy() to avoid reference to reset value
                 'radar_est': radar_est_t[i].copy(),
                 'nav_est': nav_est[i].copy(),
-                'deceptive_pos': deceptive_pos[i].copy(),
-                'gamma_s': gamma_s[i],
+                'deceptive_pos': deceptive_pos[i].copy(),  # Current: x^e_t + last_offset (applied)
+                'deceptive_pos_t1': deceptive_pos_t1[i].copy(),  # Next: x^e_{t+1} + new_offset (for next step)
+                'gamma_s': gamma_s_applied[i],  # Actual applied offset's detection risk
                 'drone_nis': drone_nis[i],
                 'dist_to_fake': dist_to_fake[i],
                 'dist_to_true': dist_to_true[i],
@@ -570,10 +598,10 @@ class VectorizedSIEEnvPaper:
                 'action_rho': actions[i, 0],
                 'action_theta': actions[i, 1],  # Azimuth angle
                 'action_psi': actions[i, 2],    # Elevation angle
-                # Spoofing offset in Cartesian coordinates
-                'spoof_offset_x': spoof_offset[i, 0],
-                'spoof_offset_y': spoof_offset[i, 1],
-                'spoof_offset_z': spoof_offset[i, 2],
+                # Spoofing offset in Cartesian coordinates (actually applied)
+                'spoof_offset_x': applied_offset[i, 0],
+                'spoof_offset_y': applied_offset[i, 1],
+                'spoof_offset_z': applied_offset[i, 2],
                 # M_radar diagonal (Σ_r covariance - key for NIS bias)
                 'M_radar_xx': M_radar[i, 0, 0],
                 'M_radar_yy': M_radar[i, 1, 1],
@@ -600,6 +628,10 @@ class VectorizedSIEEnvPaper:
             new_obs, new_radar_est, _ = self.reset(indices=done_indices)
             obs[done_indices] = new_obs[done_indices]
             next_radar_est[done_indices] = new_radar_est[done_indices]
+
+        # Update offset memory for next step (1-step delay mechanism)
+        # Action a_t generates new_spoof_offset that will be applied in step t+1
+        self.last_spoof_offset = new_spoof_offset.copy()
 
         # Return: radar_est_t (x^e_t for current action's SIE), next_radar_est (x^e_{t+1} for next)
         return obs, rewards, terminateds, truncateds, radar_est_t, next_radar_est, infos
@@ -738,23 +770,29 @@ class VectorizedSIEEnvPaper:
         │   - Σ^s_θ = spoofing offset variance                            │
         │   - Cov(x^e, Δx^s) ≠ 0 (policy depends on state)                │
         │                                                                   │
-        │ Blind Spoofer Scenario:                                          │
-        │   - Attacker cannot access drone's nav_kf                        │
-        │   - Uses radar_kf state covariance M_k as proxy for Σ^r_Δ       │
-        │   - Σ^s = M_radar + σ^2_spoof · I (paper-accurate)              │
+        │ Blind Spoofer Approximation (CURRENT IMPLEMENTATION):            │
+        │   1. x^r (true position) is UNKNOWN to attacker                 │
+        │   2. Approximate: x^r ≈ x^e (use radar estimate)                │
+        │   3. Stochastic policy: μ_θ ≈ 0 (zero-mean exploration)         │
+        │   4. Result: γ^s ≈ Δx^s^T · (Σ^s)^{-1} · Δx^s                  │
+        │                                                                   │
+        │   Implementation details:                                         │
+        │   - Uses radar_kf state covariance M_k for Σ^r_Δ                │
+        │   - Σ^s = M_radar + σ^2_spoof · I                               │
+        │   - Computes Mahalanobis distance of spoof_offset               │
         └─────────────────────────────────────────────────────────────────┘
 
-        Paper Eq.22 (Mean): μ^s = x^r + μ_θ
-        In blind scenario: x^r ≈ x^e, so μ^s ≈ x^e + E[Δx^s]
+        Mathematical derivation:
+        1. Paper Eq.17: γ^s = (x^s - x^r - μ_θ)^T · Σ^{-1} · (x^s - x^r - μ_θ)
+        2. Substitute x^s = x^e + Δx^s:
+           γ^s = (x^e + Δx^s - x^r - μ_θ)^T · Σ^{-1} · (x^e + Δx^s - x^r - μ_θ)
+        3. Blind approximation x^r ≈ x^e:
+           γ^s ≈ (Δx^s - μ_θ)^T · Σ^{-1} · (Δx^s - μ_θ)
+        4. Stochastic policy μ_θ ≈ 0:
+           γ^s ≈ Δx^s^T · Σ^{-1} · Δx^s
 
-        For deterministic policy (evaluation): μ_θ = Δx^s, so:
-        γ^s = (x^s - x^e - Δx^s)^T · (Σ^s)^{-1} · (x^s - x^e - Δx^s) = 0
-
-        For stochastic policy (training): μ_θ ≈ 0 (zero-mean offset), so:
-        γ^s ≈ Δx^s^T · (Σ^s)^{-1} · Δx^s
-
-        This measures how "unusual" the spoofing offset is relative to
-        the combined uncertainty from radar estimation and spoofing strategy.
+        This measures the Mahalanobis distance of the spoofing offset,
+        representing detection risk at the UAV's navigation filter.
         """
         # Eq.14 & Theorem 1: Radar estimation error covariance (Σ^r_Δ)
         # Use filtered state covariance M_k (NOT innovation covariance S_k)
@@ -850,11 +888,11 @@ class VectorizedSIEEnvPaper:
             gamma_s = gamma_s_precomputed
         else:
             # Fallback: recalculate spoof_offset from deceptive_pos
-            # NOTE: This assumes radar_est and deceptive_pos are from same time step
-            # Only valid for reset() where deceptive_pos = radar_est (zero offset)
-            # In step(), gamma_s is always precomputed and passed in
+            # VALID: After 1-step delay fix, radar_est and deceptive_pos are now
+            # from the SAME time step (both t+1 in step(), both t in reset())
+            # This calculation is now mathematically correct: offset = x^s_k - x^e_k
             spoof_offset = deceptive_pos - radar_est
-            gamma_s = self._calculate_predicted_nis(spoof_offset)
+            gamma_s, _ = self._calculate_predicted_nis(spoof_offset)  # Returns (gamma_s, M_radar)
 
         # s4: Velocity information
         radar_vel_est = self.radar_kf.get_velocity_estimates()
@@ -1036,9 +1074,9 @@ class VectorizedSIEEnvPaper:
         result[mask] = np.exp(-np.log(1 + x[mask] - x_th + 1e-6)) - 1.0
 
         # Case 2: x < threshold (constraint satisfied) → positive reward
-        # Paper's original implementation (Eq. 39c)
+        # Paper's original implementation (Eq. 39c): f(x) = (x_th - x) / x_th
+        # Returns values in [0, 1]: 0 when x=x_th (barely satisfied), 1 when x=0 (perfect)
         result[~mask] = (x_th - x[~mask]) / x_th
-        result[~mask] = 0.0
 
         return result
 
@@ -1539,7 +1577,7 @@ def train_sie_sac_paper(
     buffer = SIEReplayBuffer(buffer_size, state_dim, action_dim, pos_dim=3)
 
     # Initialize
-    current_obs, current_radar_est, _ = env.reset(seed=seed)
+    current_obs, _, _ = env.reset(seed=seed)  # radar_est not needed (step returns it)
 
     total_steps = 0
     episode_rewards = []
@@ -1560,15 +1598,17 @@ def train_sie_sac_paper(
         else:
             actions = agent.select_actions_batch(current_obs)
 
-        # Step - now returns radar_est and next_radar_est
-        next_obs, rewards, terminateds, truncateds, radar_est, next_radar_est, infos = env.step(actions)
+        # Step - returns (obs, rewards, terminateds, truncateds, radar_est_t, next_radar_est, infos)
+        # radar_est_t = x^e_t (for SIE calculation), next_radar_est = x^e_{t+1} (for next state)
+        next_obs, rewards, terminateds, truncateds, radar_est_t, next_radar_est, infos = env.step(actions)
         dones = terminateds | truncateds
 
         # Store with radar estimates (x^e), NOT deceptive positions
         # Agent will compute x^s = x^e + Δx^s during update
+        # Use radar_est_t (x^e_t for current step) instead of current_radar_est to avoid stale value
         buffer.add_batch(
             current_obs, actions, rewards, next_obs, dones.astype(np.float32),
-            current_radar_est, next_radar_est
+            radar_est_t, next_radar_est
         )
 
         # Track episodes
@@ -1584,7 +1624,7 @@ def train_sie_sac_paper(
                 env_episode_lengths[i] = 0
 
         current_obs = next_obs
-        current_radar_est = next_radar_est
+        # radar_est is now directly obtained from step(), no need to track separately
 
         # Update
         if total_steps >= update_after and len(buffer) >= batch_size:
@@ -1753,19 +1793,22 @@ def run_simulation_after_training(agent, env_config, save_dir, entropy_type, max
         # 데이터 기록
         drone_positions.append(env.true_pos[0].copy())
 
-        # Spoof position 계산: x^s = x^e + Δx^s
-        rho, theta, psi = action[0]
-        cos_psi = np.cos(psi)
-        dx = rho * cos_psi * np.cos(theta)
-        dy = rho * cos_psi * np.sin(theta)
-        dz = -rho * np.sin(psi)
-        spoof_offset = np.array([dx, dy, dz])
-        spoof_pos = radar_est_t[0] + spoof_offset
+        # Spoof position - ACTUAL position sent to UAV (1-step delay)
+        # Use infos['deceptive_pos'] which is what UAV actually received this step
+        # NOT action-based calculation (that's for NEXT step due to 1-step delay!)
+        if 'deceptive_pos' in infos[0]:
+            spoof_pos = np.array(infos[0]['deceptive_pos'])
+        else:
+            # Fallback: use applied offset from infos
+            dx = infos[0].get('spoof_offset_x', 0.0)
+            dy = infos[0].get('spoof_offset_y', 0.0)
+            dz = infos[0].get('spoof_offset_z', 0.0)
+            spoof_pos = radar_est_t[0] + np.array([dx, dy, dz])
         spoof_positions.append(spoof_pos)
 
         actions_history.append(action[0].copy())
         rewards_history.append(reward[0])
-        nis_values.append(infos[0].get('nis', 0))
+        nis_values.append(infos[0].get('drone_nis', 0))  # Fixed: 'nis' -> 'drone_nis'
 
         total_reward += reward[0]
         obs = next_obs

@@ -225,15 +225,17 @@ def run_episode(env, model, max_steps=10000):
             true_pos = info.get('true_pos', np.zeros(3))
             radar_est = info.get('radar_est', true_pos)
 
-        # 기만 신호 위치 계산 (Eq.30: x^s = x^e + Δx^s)
-        rho, theta, psi = action
-        spoof_offset = np.array([
-            rho * np.cos(psi) * np.cos(theta),
-            rho * np.cos(psi) * np.sin(theta),
-            -rho * np.sin(psi)
-        ])
-        # NOTE: 논문에서는 x^s = x^e + Δx^s (radar_est 기반)
-        spoof_pos = radar_est + spoof_offset
+        # 기만 신호 위치 - ACTUAL position sent to UAV (1-step delay)
+        # Use info['deceptive_pos'] which is what UAV actually received this step
+        # NOT action-based calculation (that's for NEXT step due to 1-step delay!)
+        if 'deceptive_pos' in info:
+            spoof_pos = np.array(info['deceptive_pos'])
+        else:
+            # Fallback: use applied offset from info (spoof_offset_x/y/z are applied offset)
+            dx = info.get('spoof_offset_x', 0.0)
+            dy = info.get('spoof_offset_y', 0.0)
+            dz = info.get('spoof_offset_z', 0.0)
+            spoof_pos = radar_est + np.array([dx, dy, dz])
 
         data['drone_positions'].append(true_pos)
         data['spoof_positions'].append(spoof_pos)
@@ -417,14 +419,17 @@ def visualize_realtime(env, model, max_steps=1000, update_interval=5):
             true_pos = info.get('true_pos', np.zeros(3))
             radar_est = info.get('radar_est', true_pos)
 
-        # 기만 위치 계산 (Eq.30: x^s = x^e + Δx^s)
-        rho, theta, psi = action
-        spoof_offset = np.array([
-            rho * np.cos(psi) * np.cos(theta),
-            rho * np.cos(psi) * np.sin(theta),
-            -rho * np.sin(psi)
-        ])
-        spoof_pos = radar_est + spoof_offset  # 논문: x^s = x^e + Δx^s
+        # 기만 위치 - ACTUAL position sent to UAV (1-step delay)
+        # Use info['deceptive_pos'] which is what UAV actually received
+        # NOT action-based calculation (that's for NEXT step!)
+        if 'deceptive_pos' in info:
+            spoof_pos = np.array(info['deceptive_pos'])
+        else:
+            # Fallback: use applied offset from info
+            dx = info.get('spoof_offset_x', 0.0)
+            dy = info.get('spoof_offset_y', 0.0)
+            dz = info.get('spoof_offset_z', 0.0)
+            spoof_pos = radar_est + np.array([dx, dy, dz])
 
         drone_path.append(true_pos)
         spoof_path.append(spoof_pos)
@@ -460,9 +465,15 @@ def visualize_realtime(env, model, max_steps=1000, update_interval=5):
             dist_true = info.get('dist_to_true', 0)
             spoof_dist = np.linalg.norm(spoof_pos[:2] - true_pos[:2])  # 기만 오프셋 거리
 
+            # Get APPLIED offset (actually used this step, not next action)
+            applied_x = info.get('spoof_offset_x', 0.0)
+            applied_y = info.get('spoof_offset_y', 0.0)
+            applied_z = info.get('spoof_offset_z', 0.0)
+            applied_mag = np.sqrt(applied_x**2 + applied_y**2 + applied_z**2)
+
             title = (f"Step: {step} | Reward: {reward:.1f} | Total: {total_reward:.1f}\n"
                     f"γ^s: {gamma_s:.2f} | Dist to Fake: {dist_fake:.1f} | Dist to True: {dist_true:.1f}\n"
-                    f"Spoof Offset: {spoof_dist:.1f}m | Action: ρ={rho:.1f}, θ={np.degrees(theta):.1f}°, ψ={np.degrees(psi):.1f}°")
+                    f"Spoof Offset: {spoof_dist:.1f}m | Applied |Δx^s|: {applied_mag:.1f}m")
             ax.set_title(title, fontsize=11)
 
             # 축 설정 - 기만 위치도 포함
