@@ -7,11 +7,11 @@ IEEE Transactions on Aerospace and Electronic Systems (TAES), 2025
 
 Paper Equations Implemented:
 -----------------------------
-- Eq.29: State space s = [s1, s2, s3, s4]
-         s1 = [d, θ, ψ] - position in spherical coordinates
-         s2 = [Δ_D, Δ^s_D] - triangle angles (deception geometry)
-         s3 = γ^s - predicted NIS
-         s4 = [|v|, θ_v] - velocity info
+- Eq.29: State space s = [s1, s2, s3, s4] (Extended to 9 features)
+         s1 = [d, θ, ψ] - position in spherical coordinates (3 features)
+         s2 = [Δ_D, Δ^s_D] - triangle angles (deception geometry) (2 features)
+         s3 = γ^s - predicted NIS (1 feature)
+         s4 = [|v|, θ_v_fake, θ_v_true] - velocity info (3 features, extended)
 
 - Eq.30: Deceptive position x^s = x^e + Δx^s
          Where x^e = radar estimate, Δx^s = spoofing offset
@@ -347,7 +347,9 @@ class VectorizedSIEEnvPaper:
         self.max_steps = config.get('max_steps', 1000)
 
         # Spaces
-        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(8,), dtype=np.float32)
+        # State: [d, θ, ψ, Δ_D, Δ^s_D, γ^s, |v|, θ_v_fake, θ_v_true] = 9 features
+        # Extended from paper's 8 to include both velocity angles (fake & true destinations)
+        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(9,), dtype=np.float32)
         self.action_space = spaces.Box(
             low=np.array([0.0, -np.pi, -np.pi/2]),
             high=np.array([self.rho_s_max, np.pi, np.pi/2]),
@@ -843,11 +845,13 @@ class VectorizedSIEEnvPaper:
         │                      Δ_D: angle at x^e between x_D and x^s_D    │
         │                      Δ^s_D: angle at x^s between x_D and x^s_D  │
         │                                                                  │
-        │ s3 = γ^s            Predicted NIS (concealment constraint)      │
+        │ s3 = γ^s                   Predicted NIS (concealment constraint) │
         │                                                                  │
-        │ s4 = [|v|, θ_v]     Velocity info                               │
+        │ s4 = [|v|, θ_v_fake, θ_v_true]  Velocity info (3 features)      │
         │                      |v| = speed magnitude                       │
-        │                      θ_v = angle between velocity and fake dest  │
+        │                      θ_v_fake = angle between v and fake dest    │
+        │                      θ_v_true = angle between v and true dest    │
+        │                      (Extended from paper for full observability)│
         └─────────────────────────────────────────────────────────────────┘
 
         Triangle Geometry:
@@ -899,20 +903,17 @@ class VectorizedSIEEnvPaper:
         speed = np.linalg.norm(radar_vel_est, axis=1)
 
         # Angle between velocity and direction to fake destination
-        n1 = np.linalg.norm(radar_vel_est, axis=1)
-        n2 = np.linalg.norm(vec_xe_to_xsD, axis=1)
-        valid = (n1 > 1e-6) & (n2 > 1e-6)
-        dot = np.sum(radar_vel_est * vec_xe_to_xsD, axis=1)
-        cos_angle = np.zeros(self.n_envs)
-        cos_angle[valid] = np.clip(dot[valid] / (n1[valid] * n2[valid]), -1, 1)
-        theta_v_fake = np.arccos(cos_angle)
+        theta_v_fake = self._compute_angle_between(radar_vel_est, vec_xe_to_xsD)
 
-        # Eq.29: Stack all state components (8 features total)
+        # Angle between velocity and direction to true destination (vec_xe_to_xD from Line 879)
+        theta_v_true = self._compute_angle_between(radar_vel_est, vec_xe_to_xD)
+
+        # Eq.29 (Extended): Stack all state components (9 features total)
         # s = [s1, s2, s3, s4] where:
-        #   s1 = [d, θ, ψ]       (3 features) - position
-        #   s2 = [Δ_D, Δ^s_D]   (2 features) - triangle angles
-        #   s3 = [γ^s]          (1 feature)  - predicted NIS
-        #   s4 = [|v|, θ_v]     (2 features) - velocity
+        #   s1 = [d, θ, ψ]                      (3 features) - position
+        #   s2 = [Δ_D, Δ^s_D]                  (2 features) - triangle angles
+        #   s3 = [γ^s]                         (1 feature)  - predicted NIS
+        #   s4 = [|v|, θ_v_fake, θ_v_true]     (3 features) - velocity (extended)
         return np.stack([
             np.clip(d_r / self.rho_e, 0, 1),           # s1[0]: d (normalized by ρ_e)
             theta_r / np.pi,                            # s1[1]: θ (normalized by π)
@@ -921,7 +922,8 @@ class VectorizedSIEEnvPaper:
             angle_sD / np.pi,                           # s2[1]: Δ^s_D angle (normalized)
             np.clip(gamma_s / (2 * self.chi_sq_threshold), 0, 2),  # s3: γ^s (clipped, keep raw magnitude)
             np.clip(speed / 20.0, 0, 1),                # s4[0]: |v| (normalized)
-            theta_v_fake / np.pi,                       # s4[1]: θ_v (normalized)
+            theta_v_fake / np.pi,                       # s4[1]: θ_v_fake (normalized)
+            theta_v_true / np.pi,                       # s4[2]: θ_v_true (normalized) ← Added
         ], axis=1).astype(np.float32)
 
     def _compute_angle_between(self, vec1: np.ndarray, vec2: np.ndarray) -> np.ndarray:
