@@ -18,8 +18,14 @@ if USE_SB3:
     from stable_baselines3 import SAC
     from SIE_SAC_env import VirtualSpoofingEnvV2 as SpoofingEnv
 elif USE_PAPER_ENV:
-    # SIE_SAC_paper.py의 VectorizedSIEEnvPaper를 단일 환경 래퍼로 사용
-    from SIE_SAC_paper import VectorizedSIEEnvPaper
+    # Import configuration and environment from SIE_SAC_paper.py (SINGLE SOURCE)
+    from SIE_SAC_paper import (
+        VectorizedSIEEnvPaper,
+        TRUE_DEST,
+        FAKE_DEST,
+        DEFAULT_ENV_CONFIG,
+        DEFAULT_TRAIN_CONFIG
+    )
 
     class SpoofingEnvWrapper:
         """
@@ -106,17 +112,23 @@ def load_model(model_path: str, env, env_config: dict = None, entropy_type: str 
 
                 print(f">>> Entropy Type: {entropy_type}")
 
+                # Use global constants (imported from SIE_SAC_paper.py)
                 agent = SIESACAgentPaper(
                     state_dim=state_dim,
                     action_dim=action_dim,
                     action_low=env.action_space.low,
                     action_high=env.action_space.high,
-                    fake_dest=np.array(env_config.get('fake_dest', [800.0, -100.0, -20.0])),
-                    true_dest=np.array(env_config.get('true_dest', [800.0, 0.0, -20.0])),
-                    H_0=env_config.get('H_0', -2.0),
-                    lambda_sie=env_config.get('lambda_sie', 0.01),
-                    rho_e=env_config.get('rho_e', 1000.0),
-                    omega_1=env_config.get('omega_1', 0.8),
+                    fake_dest=FAKE_DEST,
+                    true_dest=TRUE_DEST,
+                    hidden_dim=env_config.get('hidden_dim', DEFAULT_TRAIN_CONFIG['hidden_dim']),
+                    lr=env_config.get('lr', DEFAULT_TRAIN_CONFIG['lr']),
+                    gamma=env_config.get('gamma', DEFAULT_TRAIN_CONFIG['gamma']),
+                    tau=env_config.get('tau', DEFAULT_TRAIN_CONFIG['tau']),
+                    alpha_init=env_config.get('alpha_init', DEFAULT_TRAIN_CONFIG['alpha_init']),
+                    H_0=env_config.get('H_0', DEFAULT_TRAIN_CONFIG['H_0']),
+                    lambda_sie=env_config.get('lambda_sie', DEFAULT_ENV_CONFIG['lambda_sie']),
+                    rho_e=env_config.get('rho_e', DEFAULT_ENV_CONFIG['rho_e']),
+                    omega_1=env_config.get('omega_1', DEFAULT_ENV_CONFIG['omega_1']),
                     entropy_type=entropy_type,
                 )
                 agent.load(model_path)
@@ -928,18 +940,8 @@ def main():
     print("SIE-SAC 학습 결과 시각화")
     print("=" * 60)
 
-    # 환경 생성 - SIE_SAC_paper.py의 main()과 동일한 설정 사용
-    env_config = {
-        'true_dest': [800.0, 0.0, -20.0],      # 논문 설정
-        'fake_dest': [800.0, -100.0, -20.0],  # 논문 설정
-        'rho_e': 1200.0,                        # Paper Table I
-        'lambda_sie': 0.01,
-        'omega_1': 0.8,
-        'chi_sq_threshold': 7.815,
-        'rho_s_max': 200.0,                     # Paper Table I
-        'max_steps': 2000,
-        'H_0': -2.0,                            # Paper Table I
-    }
+    # Use configuration from SIE_SAC_paper.py (SINGLE SOURCE OF TRUTH)
+    env_config = DEFAULT_ENV_CONFIG.copy()
 
     if USE_PAPER_ENV:
         print(">>> VectorizedSIEEnvPaper 래퍼 사용")

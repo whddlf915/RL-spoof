@@ -55,6 +55,54 @@ from gymnasium import spaces
 import time
 
 
+# ==================== GLOBAL CONFIGURATION (SINGLE SOURCE OF TRUTH) ====================
+
+# Destination coordinates - Paper experimental setup
+# All other files should import these constants from here
+TRUE_DEST = np.array([800.0, 0.0, -20.0], dtype=np.float32)
+FAKE_DEST = np.array([800.0, -100.0, -20.0], dtype=np.float32)
+
+# Paper Table I parameters
+DEFAULT_ENV_CONFIG = {
+    'true_dest': TRUE_DEST.tolist(),
+    'fake_dest': FAKE_DEST.tolist(),
+    'rho_e': 1200.0,
+    'lambda_sie': 0.01,
+    'omega_1': 0.8,
+    'chi_sq_threshold': 7.815,
+    'delta_gamma_threshold': 2.0,
+    'rho_s_max': 200.0,
+    'max_steps': 2000,
+    'dt': 1.0,
+    'alpha_1': 1.0,
+    'alpha_2': 0.5,
+    'alpha_3': 1.0,
+    'Q_scale': 2.0,           # Kalman filter process noise scale
+    'R_scale': 10.0,          # Kalman filter measurement noise scale
+    'radar_noise_std': 2.0,   # Radar measurement noise standard deviation (meters)
+}
+
+# Training hyperparameters
+DEFAULT_TRAIN_CONFIG = {
+    'n_envs': 32,
+    'total_timesteps': 1000000,
+    'batch_size': 256,
+    'buffer_size': 1000000,
+    'start_steps': 10000,
+    'update_after': 1000,
+    'gradient_steps': 1,
+    'H_0': -2.0,              # Target SIE (Paper Table I)
+    'save_freq': 100000,
+    'log_freq': 10000,
+    'seed': 42,
+    'hidden_dim': 256,
+    'lr': 3e-4,
+    'gamma': 0.99,
+    'tau': 0.005,
+    'alpha_init': 0.2,
+}
+
+
 # ==================== Torch SIE Calculator (Differentiable) ====================
 
 class TorchSIECalculator(nn.Module):
@@ -100,10 +148,11 @@ class TorchSIECalculator(nn.Module):
         self.omega_2 = 1.0 - omega_1
 
         # Register destinations as buffers (not parameters)
+        # Use global constants if not provided
         if fake_dest is None:
-            fake_dest = torch.tensor([800.0, -100.0, -20.0])
+            fake_dest = torch.from_numpy(FAKE_DEST)
         if true_dest is None:
-            true_dest = torch.tensor([800.0, 0.0, -20.0])
+            true_dest = torch.from_numpy(TRUE_DEST)
 
         self.register_buffer('fake_dest', fake_dest.float())
         self.register_buffer('true_dest', true_dest.float())
@@ -325,26 +374,27 @@ class VectorizedSIEEnvPaper:
         self.n_envs = n_envs
         config = config or {}
 
-        # Environment parameters
-        self.true_dest = np.array(config.get('true_dest', [800.0, 0.0, -20.0]))
-        self.fake_dest = np.array(config.get('fake_dest', [800.0, -100.0, -20.0]))
-        self.dt = config.get('dt', 1.0)
-        # self.dt = config.get('dt', 0.1)
-        self.rho_e = config.get('rho_e', 1200.0)  # Paper Table I: 1200m
+        # Environment parameters - Use DEFAULT_ENV_CONFIG as fallback
+        self.true_dest = np.array(config.get('true_dest', DEFAULT_ENV_CONFIG['true_dest']))
+        self.fake_dest = np.array(config.get('fake_dest', DEFAULT_ENV_CONFIG['fake_dest']))
+        self.dt = config.get('dt', DEFAULT_ENV_CONFIG['dt'])
+        self.rho_e = config.get('rho_e', DEFAULT_ENV_CONFIG['rho_e'])
 
         # Reward weights (Eq. 38)
-        #1,0.5,1
-        # Reward weights (α1: position, α2: velocity, α3: concealment)
-        # Reduced α3 to prevent r_gamma from dominating r_x + r_v
-        self.alpha_1 = config.get('alpha_1', 1.0)
-        self.alpha_2 = config.get('alpha_2', 0.5)
-        self.alpha_3 = config.get('alpha_3', 1.0) 
+        self.alpha_1 = config.get('alpha_1', DEFAULT_ENV_CONFIG['alpha_1'])
+        self.alpha_2 = config.get('alpha_2', DEFAULT_ENV_CONFIG['alpha_2'])
+        self.alpha_3 = config.get('alpha_3', DEFAULT_ENV_CONFIG['alpha_3'])
 
         # Constraints
-        self.chi_sq_threshold = config.get('chi_sq_threshold', 7.815)
-        self.delta_gamma_threshold = config.get('delta_gamma_threshold', 2.0)
-        self.rho_s_max = config.get('rho_s_max', 200.0)  # Paper Table I: 200m
-        self.max_steps = config.get('max_steps', 1000)
+        self.chi_sq_threshold = config.get('chi_sq_threshold', DEFAULT_ENV_CONFIG['chi_sq_threshold'])
+        self.delta_gamma_threshold = config.get('delta_gamma_threshold', DEFAULT_ENV_CONFIG['delta_gamma_threshold'])
+        self.rho_s_max = config.get('rho_s_max', DEFAULT_ENV_CONFIG['rho_s_max'])
+        self.max_steps = config.get('max_steps', DEFAULT_ENV_CONFIG['max_steps'])
+
+        # Kalman filter noise parameters
+        self.radar_noise_std = config.get('radar_noise_std', DEFAULT_ENV_CONFIG['radar_noise_std'])
+        self.Q_scale = config.get('Q_scale',DEFAULT_ENV_CONFIG['Q_scale'])
+        self.R_scale = config.get('R_scale',DEFAULT_ENV_CONFIG['R_scale'])
 
         # Spaces
         # State: [d, θ, ψ, Δ_D, Δ^s_D, γ^s, |v|, θ_v_fake, θ_v_true] = 9 features
@@ -431,13 +481,11 @@ class VectorizedSIEEnvPaper:
             self.ref_phase = np.zeros(self.n_envs, dtype=np.int32)  # Start with acceleration phase
 
             # Radar KF: attacker's view of true position
-            self.radar_kf = BatchedKalmanFilter(self.n_envs, self.dt, Q_scale=2.0, R_scale=10.0)
+            self.radar_kf = BatchedKalmanFilter(self.n_envs, self.dt, Q_scale=self.Q_scale, R_scale=self.R_scale)
             self.radar_kf.reset(positions=start_pos)
 
             # Nav KF: drone's internal KF
-            # jipark
-            # self.nav_kf = BatchedKalmanFilter(self.n_envs, self.dt, Q_scale=0.5, R_scale=1.0)
-            self.nav_kf = BatchedKalmanFilter(self.n_envs, self.dt, Q_scale=2.0, R_scale=10.0)
+            self.nav_kf = BatchedKalmanFilter(self.n_envs, self.dt, Q_scale=self.Q_scale, R_scale=self.R_scale)
             self.nav_kf.reset(positions=start_pos)
         else:
             self.true_pos[indices] = start_pos
@@ -524,7 +572,7 @@ class VectorizedSIEEnvPaper:
 
         # 7. Attacker observes drone at t+1 position and updates radar KF
         # This gives us x^e_{t+1} for the NEXT step
-        radar_noise = self._rng.normal(0, 2.0, self.true_pos.shape)  # 2m std noise
+        radar_noise = self._rng.normal(0, self.radar_noise_std, self.true_pos.shape)
         radar_measurement = self.true_pos + radar_noise  # true_pos is now at t+1
 
         self.radar_kf.predict()
@@ -1511,23 +1559,38 @@ class SIESACAgentPaper:
 
 def train_sie_sac_paper(
     env_config: Dict,
-    n_envs: int = 16,
-    total_timesteps: int = 1000000,
-    batch_size: int = 256,
-    buffer_size: int = 1000000,
-    start_steps: int = 10000,
-    update_after: int = 1000,
-    gradient_steps: int = 1,
-    # H_0: float = 18.5,  # jipark
-    H_0: float = -2.0,
-    save_freq: int = 50000,
-    log_freq: int = 5000,
+    n_envs: int = None,
+    total_timesteps: int = None,
+    batch_size: int = None,
+    buffer_size: int = None,
+    start_steps: int = None,
+    update_after: int = None,
+    gradient_steps: int = None,
+    H_0: float = None,
+    save_freq: int = None,
+    log_freq: int = None,
     save_dir: str = 'models/SIE_SAC_paper',
-    seed: int = 42,
+    seed: int = None,
+    hidden_dim: int = None,
+    lr: float = None,
+    gamma: float = None,
+    tau: float = None,
+    alpha_init: float = None,
     device: str = None,
     entropy_type: str = 'sie',  # 'sie' or 'action'
 ):
     """Train SIE-SAC following the paper exactly."""
+
+    # Validate required parameters
+    required_params = {
+        'n_envs': n_envs, 'total_timesteps': total_timesteps, 'batch_size': batch_size,
+        'buffer_size': buffer_size, 'start_steps': start_steps, 'update_after': update_after,
+        'gradient_steps': gradient_steps, 'H_0': H_0, 'save_freq': save_freq, 'log_freq': log_freq,
+        'seed': seed, 'hidden_dim': hidden_dim, 'lr': lr, 'gamma': gamma, 'tau': tau, 'alpha_init': alpha_init
+    }
+    missing = [name for name, value in required_params.items() if value is None]
+    if missing:
+        raise ValueError(f"Missing required parameters: {missing}. Please provide values from DEFAULT_TRAIN_CONFIG.")
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -1565,12 +1628,17 @@ def train_sie_sac_paper(
         action_dim=action_dim,
         action_low=env.action_space.low,
         action_high=env.action_space.high,
-        fake_dest=np.array(env_config.get('fake_dest', [800, -100, -20])),
-        true_dest=np.array(env_config.get('true_dest', [800, 0, -20])),
+        fake_dest=np.array(env_config.get('fake_dest', DEFAULT_ENV_CONFIG['fake_dest'])),
+        true_dest=np.array(env_config.get('true_dest', DEFAULT_ENV_CONFIG['true_dest'])),
+        hidden_dim=hidden_dim,
+        lr=lr,
+        gamma=gamma,
+        tau=tau,
+        alpha_init=alpha_init,
         H_0=H_0,
-        lambda_sie=env_config.get('lambda_sie', 0.01),
-        rho_e=env_config.get('rho_e', 1200.0),
-        omega_1=env_config.get('omega_1', 0.8),
+        lambda_sie=env_config.get('lambda_sie', DEFAULT_ENV_CONFIG['lambda_sie']),
+        rho_e=env_config.get('rho_e', DEFAULT_ENV_CONFIG['rho_e']),
+        omega_1=env_config.get('omega_1', DEFAULT_ENV_CONFIG['omega_1']),
         device=device,
         entropy_type=entropy_type,
     )
@@ -1963,34 +2031,31 @@ def main():
     # 사용자가 entropy type 선택
     entropy_type = select_entropy_type()
 
-    # Hyperparameters matching Paper Table I
-    env_config = {
-        'true_dest': [800.0, 0.0, -20.0],
-        'fake_dest': [800.0, -100.0, -20.0],
-        'rho_e': 1200.0,        # Paper Table I: 1200m
-        'lambda_sie': 0.01,
-        'omega_1': 0.8,
-        'chi_sq_threshold': 7.815,
-        'rho_s_max': 200.0,     # Paper Table I: 200m
-        'max_steps': 2000,
-    }
+    # Use global configuration (single source of truth)
+    env_config = DEFAULT_ENV_CONFIG.copy()
 
     # save_dir을 entropy_type에 따라 구분
     save_dir = f'models/SIE_SAC_paper_{entropy_type}'
 
     train_params = {
         'env_config': env_config,
-        'n_envs': 32,
-        'total_timesteps': 1000000,
-        'batch_size': 256,
-        'start_steps': 10000,
-        'update_after': 1000,
-        'H_0': -2.0,            # Paper Table I: -2.0
-        # 'H_0': 18.5,            # jipark
-        'save_freq': 100000,
-        'log_freq': 10000,
+        'n_envs': DEFAULT_TRAIN_CONFIG['n_envs'],
+        'total_timesteps': DEFAULT_TRAIN_CONFIG['total_timesteps'],
+        'batch_size': DEFAULT_TRAIN_CONFIG['batch_size'],
+        'buffer_size': DEFAULT_TRAIN_CONFIG['buffer_size'],
+        'start_steps': DEFAULT_TRAIN_CONFIG['start_steps'],
+        'update_after': DEFAULT_TRAIN_CONFIG['update_after'],
+        'gradient_steps': DEFAULT_TRAIN_CONFIG['gradient_steps'],
+        'H_0': DEFAULT_TRAIN_CONFIG['H_0'],
+        'save_freq': DEFAULT_TRAIN_CONFIG['save_freq'],
+        'log_freq': DEFAULT_TRAIN_CONFIG['log_freq'],
         'save_dir': save_dir,
-        'seed': 42,
+        'seed': DEFAULT_TRAIN_CONFIG['seed'],
+        'hidden_dim': DEFAULT_TRAIN_CONFIG['hidden_dim'],
+        'lr': DEFAULT_TRAIN_CONFIG['lr'],
+        'gamma': DEFAULT_TRAIN_CONFIG['gamma'],
+        'tau': DEFAULT_TRAIN_CONFIG['tau'],
+        'alpha_init': DEFAULT_TRAIN_CONFIG['alpha_init'],
         'entropy_type': entropy_type,
     }
 
